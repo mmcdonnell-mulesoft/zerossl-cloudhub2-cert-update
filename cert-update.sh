@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
 
-# Client ID Variable
-CID="c78633e2d086486283e7bbc813428293"
-# Client Secret Variable
-CSECRET="f7128C1E705f46A9b2C1437B8Df8e79e"
-
-#Zero SSL API Key
-ZSSLAPIKEY="76f0930e6c61d516e761396a7ca96727"
-
 ##############################################
 ## GETOPT VARIABLES + ARGUMENT PARSING START##
 ##############################################
@@ -20,9 +12,8 @@ unset -v PSNAME
 LONG_ARGS="orgid:,private-space:,help"
 SHORT_ARGS="o:,p:,h"
 
-
 # Help Function
-help()
+function help()
 {
     echo "Based on standards I found on the internet - MPM"
     echo "Usage: ${0}
@@ -70,68 +61,303 @@ echo "Updating Org: ${ORGID} and Private Space: ${PSNAME}"
 ## GETOPT VARIABLES + ARGUMENT PARSING END  ##
 ##############################################
 
-
-
-# constants
-
-CERTCN="global.mulesoftplatform.com"
-TMPCERTPATH="/tmp/${CERTCN}.pem"
-PRIVATEKEYPATH="/tmp/${CERTCN}.private.key"
-CSRPATH="/tmp/${CERTCN}.csr"
-
-ZSSLBASE="https://api.zerossl.com"
-ZSSLCERTURI="${ZSSLBASE}/certificates?access_key=${ZSSLAPIKEY}"
-ZSSLVERIFYURI="${ZSSLBASE}/validation/csr?access_key=${ZSSLAPIKEY}"
-
-
-TLSCNAME="prod-int-ext-combined"
+##############################################
+##                CONSTANTS                 ##
+##############################################
+# Anypoint Platform
+CID=""
+CSECRET=""
+# URIs
 APOINTBASE="https://anypoint.mulesoft.com/"
 TOKENURI="${APOINTBASE}/accounts/api/v2/oauth2/token"
 MEURI="${APOINTBASE}/accounts/api/profile"
 ORGSURI="${APOINTBASE}/accounts/api/organizations"
 PSALLURI="${APOINTBASE}/runtimefabric/api/organizations/${ORGID}/privatespaces"
 
-echo "Cleaning up /tmp"
-rm -fv "/tmp/${CERTCN}*"
+# AWS
+AWSR53PARENT="mulesoftplatform.com."
+AWSR53ZONEID=$(aws route53 list-hosted-zones | jq --arg domain "${AWSR53PARENT}" -r '.HostedZones | map(select(.Name == $domain)) | first | .Id')
+AWSR53RECORDS=$(aws route53 list-resource-record-sets --hosted-zone-id ${AWSR53ZONEID} | jq --arg domain "${AWSR53PARENT}" -r '.ResourceRecordSets | map(select(.Name != $domain))')
+AWSR53CREATE='{"Action":"CREATE","ResourceRecordSet":{"Name":$hostname,"Type":"CNAME","TTL":5,"ResourceRecords":[{"Value":$endpoint}]}}'
+AWSR53DELETE='{"Action":"DELETE","ResourceRecordSet":{"Name":$hostname,"Type":"CNAME","TTL":5,"ResourceRecords":[{"Value":$endpoint}]}}'
+# AWS Route53 Record State
+PENDING="PENDING"
+INSYNC="INSYNC"
 
-# echo "Validating existing cert exists"
-# This will download the cert. Doesn't look like we need to.
-# </dev/null openssl s_client -connect ${CERTCN}:443 -servername ${CERTCN} | openssl x509 > ${TMPCERTPATH}
+#Threshold for Cert
+THRESHOLD=$(date +%s -d "+14 days")
+TODAY=$(date +%s)
+
+# ZeroSSL
+ZSSLAPIKEY=""
+# URIs
+ZSSLBASE="https://api.zerossl.com"
+ZSSLCERTURI="${ZSSLBASE}/certificates?access_key=${ZSSLAPIKEY}"
+ZSSLVERIFYURI="${ZSSLBASE}/validation/csr?access_key=${ZSSLAPIKEY}"
+# Cert Req Files
+ZSSLCSR="request.csr"
+ZSSLCSRCFG="request.cfg"
+ZSSLPRIKEY="private.key"
+# Zero SSL Cert State
+ISSUED="issued"
+DRAFT="draft"
+PENDING="pending_validation"
+
+##############################################
+##              END CONSTANTS               ##
+##############################################
+
+##############################################
+##                 GLOBALS                  ##
+##############################################
+
+TLSALLURI=""
+
+##############################################
+##               END GLOBALS                ##
+##############################################
+
+##############################################
+##                FUNCTIONS                 ##
+##############################################
+
+function anypoint_get_tls_contexts(){
+  local -n __RET=${1}
+  local TLS_ARR=()
+  local PSSPACES=$(curl -s ${PSALLURI} -H "Accept: application/json" -H "Authorization: Bearer ${TOKEN}")
+  local PSID=$(echo ${PSSPACES} | jq -r ".content | map(select(.name == \"${PSNAME}\")) | first | .id")
+  TLSALLURI="${PSALLURI}/{$PSID}/tlsContexts"
+  local TLSCONTEXTS=$(curl -s ${TLSALLURI} -H "Accept: application/json" -H "Authorization: Bearer ${TOKEN}")
+
+  for TLSC in $(echo "${TLSCONTEXTS}" | jq -r -c '.[] | @base64'); do
+    local TLSC_DECRYPTED=$(echo "${TLSC}" | base64 --decode | jq -r '.')
+    local TLSC_NAME=$(echo "${TLSC_DECRYPTED}" | jq -r '.name')
+    local TLSC_CN=$(echo "${TLSC_DECRYPTED}" | jq -r '.keyStore.cn')
+    if [[ ${TLSC_CN} != *"cloudhub.io"* ]]; then
+      TLS_ARR+=("${TLSC_NAME}")
+    fi
+  done;
+
+  prompt_choice CONTEXT 'Which TLS Context would you like to rotate?' "${TLS_ARR[@]}"
+  __RET=$(echo "${TLSCONTEXTS}" | jq -r --arg tlsname "${CONTEXT}" '. | map(select(.name == $tlsname)) | unique | if length == 1 then .[0] else empty end')
+
+  if [ -z "${__RET}" ]; then
+    echo "ERROR! Couldn't find Context by name '${CONTEXT}'"
+    echo ${TLSCONTEXTS}
+    exit 1;
+  fi
+
+}
+function anypoint_login() {
+  local FULLTOKEN=$(curl -s -X POST -d "client_id=${CID}&client_secret=${CSECRET}&grant_type=client_credentials" ${TOKENURI})
+  echo ${FULLTOKEN} | jq -r .access_token
+}
+function anypoint_update_context() {
+  local CONTEXT=${1}
+  local CERT=${2}
+
+  local CONTEXT_NAME=$(echo ${CONTEXT} | jq -r '.name')
+  local CONTEXT_ID=$(echo ${CONTEXT} | jq -r '.id')
+  local CONTEXT_URI="${TLSALLURI}/${CONTEXT_ID}"
+
+  local CERT_ID=$(echo ${CERT} | jq -r '.id')
+  local CERT_NAME=$(echo ${CERT} | jq -r '.common_name')
+
+  local DIRSTRUCT="${CERT_NAME}/$(date '+%Y-%m-%d')"
+  # TODO: This is specific to me.
+  local PERMADIR="${HOME}/certs/${DIRSTRUCT}"
+  local PKFILE="${PERMADIR}/${ZSSLPRIKEY}"
+
+  if [ ! -d ${PERMADIR} ]; then
+    echo "Error! ${PERMADIR} does not exist!"
+    exit 1;
+  fi
+
+  if [ ! -f ${PKFILE} ]; then
+    echo "Error! ${PKFILE} does not exist!"
+    exit 1;
+  fi;
+
+  echo "  Updating ${CONTEXT_NAME} with ${CERT_NAME}"
+  zssl_download_cert "${CERT_ID}" PEMDATA
+  local CERTDATA="$(echo ${PEMDATA} | jq -r '."certificate.crt"')"
+  local CAPTDATA="$(echo ${PEMDATA} | jq -r '."ca_bundle.crt"')"
+  local PKEYDATA="$(cat ${PKFILE} | awk '{printf "%s\n", $0}')"
+  # "keyPassphrase": "",
+  local TLSCFG_JSON='{"tlsConfig": { "keyStore": {"source": "PEM","certificate": $cert,"certificateFileName": $certname,"key": $pkey,"keyFileName": $pkeyname,"capath": $capath,"capathFileName": $capathname}}}'
+  local TLSCFG=$(jq --null-input --arg cert "${CERTDATA}" --arg certname "certificate.crt" --arg pkey "${PKEYDATA}" --arg pkeyname "${ZSSLPRIKEY}" --arg capath "${CAPTDATA}" --arg capathname "ca_bundle.crt" "${TLSCFG_JSON}")
+  local CONTEXT_UPDATE=$(curl -s -X PATCH -H "Accept: application/json" -H "Content-Type: application/json" -H "Authorization: Bearer ${TOKEN}" -d "${TLSCFG}" ${CONTEXT_URI})
+  # curl -X PATCH -H "Accept: application/json" -H "Content-Type: application/json" -H "Authorization: Bearer ${TOKEN}" -d "${TLSCFG}" ${CONTEXT_URI}
+  if [ -z "$(echo ${CONTEXT_UPDATE} | jq -r '.id')" ]; then
+    echo "Updating ${CONTEXT_NAME} failed!"
+    echo "${CONTEXT_UPDATE}"
+    exit 1;
+  fi
+}
+function aws_r53_create_if_not_exists() {
+  local CNAME=${1}
+  local VALUE=${2}
+  local -n CHANGE_ID=${3}
+
+  #
+  if [[ 1 > $(echo "${AWSR53RECORDS}" |  jq --arg fqdn "$(echo ${CNAME} | awk '{print tolower($0)}')." -r '. | map(select(.Name==$fqdn)) | length') ]]; then
+    # We need to create
+    local RECORD=$(jq --null-input --arg hostname "${CNAME}" --arg endpoint "${VALUE}" ${AWSR53CREATE})
+    local BATCH=$(jq --null-input "{Changes:[${RECORD}]}")
+    local CHANGE=$(aws route53 change-resource-record-sets --hosted-zone-id "${AWSR53ZONEID}" --change-batch "${BATCH}")
+    CHANGE_ID=$(echo "${CHANGE}" | jq -r '.ChangeInfo.Id')
+
+    echo "  New Record ${CNAME} added successfully!"
+    AWSR53RECORDS=$(aws route53 list-resource-record-sets --hosted-zone-id ${AWSR53ZONEID} | jq --arg domain "${AWSR53PARENT}" -r '.ResourceRecordSets | map(select(.Name != $domain))')
+  fi
+}
+function aws_r53_delete_if_exists() {
+  local CNAME=${1}
+  local VALUE=${2}
+  #
+  EXISTS=$(echo "${AWSR53RECORDS}" |  jq --arg fqdn "${CNAME}." -r '. | map(select(.Name==$fqdn)) | length')
+  if [[ 0 < ${EXISTS} ]]; then
+    # We need to create
+    RECORD=$(jq --null-input --arg hostname "${CNAME}" --arg endpoint "${VALUE}" ${AWSR53DELETE})
+    BATCH=$(jq --null-input "{Changes:[${RECORD}]}")
+    CHANGE_ID=$(aws route53 change-resource-record-sets --hosted-zone-id "${AWSR53ZONEID}" --change-batch "${BATCH}" | jq -r '.ChangeInfo.Id')
+    echo "  Record ${CNAME} Deleted successfully!"
+    # We don't need to check on this change status
+    AWSR53RECORDS=$(aws route53 list-resource-record-sets --hosted-zone-id ${AWSR53ZONEID} | jq --arg domain "${AWSR53PARENT}" -r '.ResourceRecordSets | map(select(.Name != $domain))')
+  fi
+}
+function aws_r53_wait_for_propogation() {
+  local CNAME=${1}
+  local CHANGE_ID=${2}
+  local CHANGE=$(aws route53 get-change --id "${CHANGE_ID}")
+  local CHANGE_COUNTER=0
+  while [ "${INSYNC}" != "${CHANGE_STATUS}" ]; do
+    echo "  Waiting for new record (${CNAME}) to propagate. (Waiting: ${CHANGE_COUNTER}, Timeout 2 Minutes)"
+    sleep 2;
+    CHANGE=$(aws route53 get-change --id "${CHANGE_ID}")
+    local CHANGE_STATUS=$(echo "${CHANGE}" | jq -r '.ChangeInfo.Status')
+    CHANGE_COUNTER=$((CHANGE_COUNTER+1))
+    if [ 60 -lt $CHANGE_COUNTER ]; then
+      echo "Error - Propagation took too long. (Waiting: ${CHANGE_COUNTER})"
+      echo ${CHANGE}
+      exit 99
+    fi
+  done
+  echo "  Record for ${CNAME} successfully propagated!"
+}
+function is_expiring_soon() {
+  local __EXPIRATION=${1}
+  echo $([[ (${__EXPIRATION} -ge ${TODAY} && ${__EXPIRATION} -le ${THRESHOLD}) || (${__EXPIRATION} < ${TODAY}) ]])
+}
+
+function prompt_choice() {
+  if [ -z "${1}" ]; then
+    echo "Error! You need to pass in a parameter!"
+    echo "  ${0} 'Do you like apples?' ('Yes' 'No')"
+    exit 1
+  fi;
+  local -n CHOICE=${1}
+  local MSG=${2}
+  shift 2;
+  local OPTIONS=("$@")
 
 
-# echo "Getting our auth token for Client: ${CID}"
-# FULLTOKEN=$(curl -s -X POST -d "client_id=${CID}&client_secret=${CSECRET}&grant_type=client_credentials" ${TOKENURI})
-# TOKEN=$(echo ${FULLTOKEN} | jq -r .access_token)
+  local MIN=1
+  local MAX=${#OPTIONS[@]}
+  local OPT=-1
+  CHOICE="!@#$%^&*()"
 
-# echo "Getting private space: $PSNAME"
-# PSSPACES=$(curl -s ${PSALLURI} -H "Accept: application/json" -H "Authorization: Bearer ${TOKEN}")
+  if [[ ${MAX} -gt 1 ]]; then
+    while [[ "${OPT}" -lt ${MIN} || "${OPT}" -gt ${MAX} ]]; do
+      for i in "${!OPTIONS[@]}"; do
+        echo "$(($i+1))   ${OPTIONS[$i]}"
+      done
+      read -p "${MSG} " OPT
+      if [[ "${OPT}" -ge ${MIN} && "${OPT}" -le ${MAX} ]]; then
+        CHOICE="${OPTIONS[$((${OPT}-1))]}"
+      fi
+    done;
+  else
+    CHOICE="${OPTIONS[0]}"
+  fi;
+}
+function zssl_download_cert(){
+  local CERTID=${1}
+  local -n __RET=${2}
+  local URI="${ZSSLBASE}/certificates/${CERTID}/download/return?access_key=${ZSSLAPIKEY}"
+  __RET=$(curl -s -H "Content-Type: application/json" ${URI})
+  
+  if [ -z "$(echo ${__RET} | jq -r '."ca_bundle.crt"')" ]; then
+    echo "Download of PEM Data failed!"
+    echo ${__RET}
+    exit 1
+  fi
+}
+function zssl_get_active_certs_by_name() {
+  local CERTCN=${1}
+  curl -s -H "Content-Type: application/json" ${ZSSLCERTURI}| \
+    jq --arg cname "${CERTCN}" --arg issued "${ISSUED}" --arg draft "${DRAFT}" \
+      -r '.results | map(select(.common_name == $cname and (.status == $issued or .status == $draft)))'
+}
+function zssl_request_cert(){
+  local CERTCN=${1}
+  local -n __RET=${2}
+  shift 2;
+  local SANS=("$@")
+  local DIRSTRUCT="${CERTCN}/$(date '+%Y-%m-%d')"
 
-# # Get Private Space ID
-# PSID=$(echo ${PSSPACES} | jq -r ".content | map(select(.name == \"${PSNAME}\")) | first | .id")
-# PSURI="${PSALLURI}/{$PSID}"
-# TLSALLURI="${PSURI}/tlsContexts"
+  # TODO: This is specific to me.
+  local PERMADIR="${HOME}/certs/${DIRSTRUCT}"
+  local TMPDIR="/tmp/${DIRSTRUCT}"
 
-# # My spaces will only have 1 context outside of default. We'll be cool with that assumption for now.
-# echo "Getting TLS Context ID: ${TLSCNAME}"
-# TLSCONTEXTS=$(curl -s ${TLSALLURI} -H "Accept: application/json" -H "Authorization: Bearer ${TOKEN}")
+  if [ ! -d "${PERMADIR}" ]; then
+    # echo "  Requesting CSR"
+    zssl_request_csr "${TMPDIR}" "${CERTCN}" "${SANS[@]}"
+    mkdir -p "${PERMADIR}"
+    # If the CSR is valid - we now need to save that CSR somewhere smart!
+    mv ${TMPDIR}/* ${PERMADIR}
+  fi
 
-# TLSCONTEXTID=$(echo ${TLSCONTEXTS} | jq -r ". | map(select(.name == \"${TLSCNAME}\")) | first | .id")
-# echo "  ID: ${TLSCONTEXTID}"
-# TLSURI="${TLSALLURI}/${TLSCONTEXTID}"
+  local PRMCSR="${PERMADIR}/${ZSSLCSR}"
+  local CSRDATA="$(cat ${PRMCSR} | awk '{printf "%s\n", $0}')" # Replace Newlines with \n for JSON compatibility
+  local DOMAIN_LIST="${CERTCN}"
+  for DOMAIN in "${SANS[@]}"; do
+    DOMAIN_LIST+=",${DOMAIN}"
+  done
 
-# echo "Validating existing TLS"
-# TLS_TO_UPDATE=$(curl -s ${TLSURI} -H "Accept: application/json" -H "Authorization: Bearer ${TOKEN}")
+  # Build the cert detail object
+  local NEWCERTDTL=$(jq -c --null-input --arg cert_domains "${DOMAIN_LIST}" --arg csr_data "${CSRDATA}" '{"certificate_domains": $cert_domains, "certificate_csr": $csr_data, "certificate_validity_days": 90, "strict_domains": 1}')
 
-# echo ${TLS_TO_UPDATE}
+  # Actually make the request
+  __RET=$(curl -s -X POST -H "Content-Type: application/json" -d "${NEWCERTDTL}" ${ZSSLCERTURI})
+  if [ -z "$(echo ${__RET} | jq -r '.id')" ]; then
+    echo "Bad Cert! Do not validate!"
+    echo ${__RET}
+    exit 1
+  fi
 
-# 
+  zssl_validate_cert "${__RET}"
+}
+function zssl_request_csr() {
+  # Args
+  local TMPDIR=${1}
+  local CERTCN=${2}
 
-ZSSLCERTS=$(curl -s ${ZSSLCERTURI} -H "Content-Type: application/json" | jq -r ".results | map(select(.common_name == \"${CERTCN}\"))")
-NEWCERT=$(echo ${ZSSLCERTS} | jq -r ". | map(select(.status == \"draft\")) | unique | if length == 1 then .[0] else empty end")
-if [ -z "${NEWCERT}" ]; then
-  echo "Creating CSR for ${CERTCN}!"
-  openssl req -new -nodes -out ${CSRPATH} -keyout ${PRIVATEKEYPATH} -newkey rsa:2048 -config <(
-cat <<-END
+  #Shift 2 because there are 2 args before this one.
+  shift 2;
+  local SANS=("$@")
+
+  # Local Constants
+  local TMPCSR="${TMPDIR}/${ZSSLCSR}"
+  local TMPPK="${TMPDIR}/${ZSSLPRIKEY}"
+  local TMPCSRCFG="${TMPDIR}/${ZSSLCSRCFG}"
+
+  #
+  rm -rf ${TMPDIR} && mkdir -p ${TMPDIR}
+
+  #
+  echo "  Creating CSR for ${CERTCN}!"
+  cat > $TMPCSRCFG <<-END
 [req]
 default_bits = 2048
 prompt = no
@@ -151,75 +377,149 @@ CN = ${CERTCN}
 subjectAltName = @alt_names
 
 [ alt_names ]
-DNS.1 = int.global.mulesoftplatform.com
-DNS.2 = primary.mulesoftplatform.com
-DNS.3 = int.primary.mulesoftplatform.com
-DNS.4 = dr.mulesoftplatform.com
-DNS.5 = int.dr.mulesoftplatform.com
 END
-) 2>/dev/null
+  # DNS.1 = your-new-domain.com
+  for i in "${!SANS[@]}"; do
+    echo "DNS.$(($i+1)) = ${SANS[$i]}" >> ${TMPCSRCFG}
+  done
 
-  CSR="{\"csr\": \"$(cat ${CSRPATH} | awk '{printf "%s\\n", $0}')\"}"
-  VALIDCSR=$(curl -s -X POST -H "Content-Type: application/json" -d "${CSR}" ${ZSSLVERIFYURI}) 
+  # Generate the CSR and the Private Key
+  openssl req -new -sha256 -nodes -out ${TMPCSR} -newkey rsa:2048 -keyout ${TMPPK} -config <( cat $TMPCSRCFG )
+  CSRDATA="$(cat ${TMPCSR} | awk '{printf "%s\n", $0}')" # Replace Newlines with \n for JSON compatibility
+  CSR=$(jq --null-input --arg csr_data "${CSRDATA}" '{"csr": $csr_data}')
+
+  # Validate CSR!
+  VALIDCSR=$(curl -s -X POST -H "Content-Type: application/json" -d "${CSR}" ${ZSSLVERIFYURI})
   if [ "true" != "$(echo ${VALIDCSR} | jq -r '.valid')" ]; then
-    echo "Bad CSR! Do not submit!"
+    echo "Bad CSR! Will not submit!"
     echo ${VALIDCSR}
     exit 1
   fi
+}
+function zssl_validate_cert(){
+  local CERT=${1}
+  local CERT_NAME=$(echo ${CERT} | jq -r '.common_name')
+  local CERT_ID=$(echo ${CERT} | jq -r '.id')
+  local CERT_URI_BASE="${ZSSLBASE}/certificates/${CERT_ID}"
+  local CERT_URI="${CERT_URI_BASE}?access_key=${ZSSLAPIKEY}"
+  local CERT_CHALLENGEURI="${CERT_URI_BASE}/challenges?access_key=${ZSSLAPIKEY}"
+  local RECHECK=0
 
-  echo "CSR is valid! Moving forward with submitting update request!"
+  #
+  if [ "${DRAFT}" == "$(echo ${CERT} | jq -r '.status')" ]; then
+    local CID=""
+    local KEY=""
+    
+    #
+    echo "  Cert ($CERT_NAME) is in ${DRAFT} state. Validating it!"
+    for FQDN in $(echo ${CERT} | jq -r ".validation.other_methods | keys[]"); do
+      KEY=$(echo ${CERT} | jq -r ".validation.other_methods.\"${FQDN}\".cname_validation_p1")
+      local VAL=$(echo ${CERT} | jq -r ".validation.other_methods.\"${FQDN}\".cname_validation_p2")
+      aws_r53_create_if_not_exists ${KEY} ${VAL} CID
+    done
+    if [ ! -z "${CID}" ]; then
+      aws_r53_wait_for_propogation ${KEY} "${CID}"
+    fi;
 
-  NEWCERTDTL=$( echo "{
-  \"certificate_domains\": \"${CERTCN},int.${CERTCN},primary.mulesoftplatform.com,int.primary.mulesoftplatform.com,dr.mulesoftplatform.com,int.dr.mulesoftplatform.com\",
-  \"certificate_csr\": \"$(cat ${CSRPATH} | awk '{printf "%s\\n", $0}')\",
-  \"certificate_validity_days\": 90,
-  \"strict_domains\": 1
-}" | jq -c '.');
+    # # https://zerossl.com/documentation/api/verify-domains/
+    local VALIDATE=$(curl -s -X POST -H "Content-Type: application/json" -d '{"validation_method": "CNAME_CSR_HASH"}' ${CERT_CHALLENGEURI})
+    local VAL_STATUS=$(echo ${VALIDATE} | jq -r '.status')
+    if [ -z "${VAL_STATUS}" ]; then
+      echo "Error! Cert is not validating appropriately!"
+      echo "${CERT}"
+      echo ""
+      echo "${VALIDATE}"
+      exit 1
+    fi
 
-  echo "${NEWCERTDTL}"
-# 
-  NEWCERT=$(curl -s -X POST -H "Content-Type: application/json" -d "${NEWCERTDTL}" ${ZSSLCERTURI})
-  if [ "true" != "$(echo ${NEWCERT} | jq -r '.success')" ]; then
-    echo "Bad Cert! Do not validate!"
-    echo ${NEWCERT}
-    exit 1
+    echo "  Validation Complete! Certificate Status: ${VAL_STATUS}."
+    if [ "${PENDING}" == "${VAL_STATUS}" ]; then
+      local ISSUE_COUNTER=0
+      while [ "${ISSUED}" != "$(echo ${CERT} | jq -r '.status')" ]; do
+        echo "  Waiting for ${CERT_NAME} to Issue!. (Waiting: ${ISSUE_COUNTER}, Timeout 2 Minutes)"
+        sleep 2;
+        CERT=$(curl -s -H "Content-Type: application/json" ${CERT_URI})
+        ISSUE_COUNTER=$((ISSUE_COUNTER+1))
+        if [ 60 -lt $ISSUE_COUNTER ]; then
+          echo "Error - Propagation took too long. (Waiting: ${ISSUE_COUNTER})"
+          echo ${CERT}
+          exit 99
+        fi
+      done;
+    fi
   fi
-fi;
-NEWCERTID=$(echo ${NEWCERT} | jq -r ".id")
 
-echo "DEBUG: Check for the existance of a record BEFORE creation - we should just challenge if that's the case"
+  #
+  echo "  Cert ($CERT_NAME) successfully issued! Removing DNS Entries!"
+  for FQDN in $(echo ${CERT} | jq -r ".validation.other_methods | keys[]"); do
+    KEY=$(echo ${CERT} | jq -r ".validation.other_methods.\"${FQDN}\".cname_validation_p1")
+    VAL=$(echo ${CERT} | jq -r ".validation.other_methods.\"${FQDN}\".cname_validation_p2")
+    aws_r53_delete_if_exists ${KEY} ${VAL}
+  done
 
-# echo "Cert was created. Time to create CNAME Records!"
-# BATCH=$(jq --null-input '{Changes:[]}')
-# DOMAINS=$(echo ${NEWCERT} | jq -r ".validation.other_methods | keys[]")
-# for FQDN in ${DOMAINS}
-# do
-#   KEY=$(echo ${NEWCERT} | jq -r ".validation.other_methods.\"${FQDN}\".cname_validation_p1")
-#   VAL=$(echo ${NEWCERT} | jq -r ".validation.other_methods.\"${FQDN}\".cname_validation_p2")
-#   RECORD=$(jq --null-input --arg hostname "${KEY}" --arg endpoint "${VAL}" '{"Action":"CREATE","ResourceRecordSet":{"Name":$hostname,"Type":"CNAME","TTL":60,"ResourceRecords":[{"Value":$endpoint}]}}')
-#   BATCH=$(echo ${BATCH} | jq ".Changes += [${RECORD}]")
-# done
+}
 
-# echo "CNAME records pre-generated - now to push to Route53"
-# MPZONEID=$(aws route53 list-hosted-zones | jq -r ".HostedZones | map(select(.Name == \"mulesoftplatform.com.\")) | first | .Id")
-# aws route53 change-resource-record-sets --hosted-zone-id "${MPZONEID}" --change-batch "${BATCH}"
+##############################################
+##              END FUNCTIONS               ##
+##############################################
 
-# echo "I'm sleeping because I'm lazy (instead of checking to make sure my AWS R53 entries are done"
-# sleep 10
+##############################################
+##              MAIN FUNCTION               ##
+##############################################
 
-# echo "Testing Challenge"
-# # https://zerossl.com/documentation/api/verify-domains/
-# ZSSLCHALLENGEURI="${ZSSLBASE}/certificates/${NEWCERTID}/challenges?access_key=${ZSSLAPIKEY}"
-# curl -s -X POST -H "Content-Type: application/json" -d "{\"validation_method\": \"CNAME_CSR_HASH\"}" ${ZSSLCHALLENGEURI}
-#RETURNS {
-#   "id": "4ddc81628ed9d163de28c4f743a06f08",
-#   "type": "3",
-#   "common_name": "global.mulesoftplatform.com",
-#   "additional_domains": "int.global.mulesoftplatform.com,primary.mulesoftplatform.com,int.primary.mulesoftplatform.com,dr.mulesoftplatform.com,int.dr.mulesoftplatform.com",
-#   "created": "2024-01-08 23:49:58",
-#   "expires": "2024-04-07 00:00:00",
-#   "status": "pending_validation", <--- THIS IS WHAT WE NEED TO SEE?
+function main() {
+  echo "Step 1) Log into Anypoint"
+  TOKEN=$(anypoint_login)
 
-# aws route53 change-resource-record-sets --hosted-zone-id "${MPZONEID}" --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":{\"Name\":\"${KEY}.\",\"Type\":\"CNAME\",\"TTL\":300,\"ResourceRecords\":[{\"Value\":\"${VAL}.\"}]}}]}"
+  echo "Step 2) Choose a TLS Context to update"
+  anypoint_get_tls_contexts ANYCONTEXT
 
-# TODO: Tomorrow upload the good cert to CH2.0!
+  local EXPIRATION=$(date +%s -d $(echo ${ANYCONTEXT} | jq -r '.keyStore.expirationDate'))
+
+  if $(is_expiring_soon ${EXPIRATION}); then # Function is weird. Just roll with it.
+    echo "Step 3) Cert Expires within threshold - start renewal"
+    local ANYCONTEXT_CN="$(echo ${ANYCONTEXT} | jq -r '.keyStore.cn')"
+    local ZSSLCERTS=$(zssl_get_active_certs_by_name "${ANYCONTEXT_CN}")
+    local CERTCOUNT=$(echo ${ZSSLCERTS} | jq -r ". | length")
+
+    # Grab the last cert that expired. We can always revoke the old one later.
+    local ZCERT=$(echo "${ZSSLCERTS}" | jq -r " . | sort_by(.expires)[-1]")
+    local ZCERT_ID=$(echo ${ZCERT} | jq -r ".id")
+    local ZCERT_STATUS=$(echo ${ZCERT} | jq -r '.status')
+    local ZCERT_EXP=$(date +%s -d "$(echo ${ZCERT} | jq -r '.expires')")
+    local ZCERT_NAME=$(echo ${ZCERT} | jq -r '.common_name')
+
+
+    echo "  There are ${CERTCOUNT} cert(s) for ${ZCERT_NAME}"
+    # At this point there are a couple options of what's happening here:
+    # a) If there is a single cert in issued state - we are replacing it.
+    # b) If there are 2 certs we are replacing one older one with a newer one
+    #     * If there is 1 issued and 1 in draft - then we need to validate it.
+    #     * If there are 2 issued - then the new is is validated.
+    if [[ 2 -eq ${CERTCOUNT} ]]; then
+      zssl_validate_cert "${ZCERT}"
+      anypoint_update_context "${ANYCONTEXT}" "${ZCERT}"
+    elif [[ 1 == ${CERTCOUNT} ]] && $(is_expiring_soon ${ZCERT_EXP}); then # Function is weird. Just roll with it.
+      #
+      echo "Step 4) Request a new cert"
+      # Convert SAN list into a bash array for use in bash function.
+      # Don't make it JSON because you're lazy.
+      SAN_LIST=$(echo ${ANYCONTEXT} | jq -r '.keyStore.san')
+      SAN_ARR=($(echo ${SAN_LIST} | sed -e 's/\[ //g' -e 's/\ ]//g' -e 's/\,//g' -e 's/"//g'))
+
+      #
+      zssl_request_cert "${ANYCONTEXT_CN}" NEW_CERT "${SAN_ARR[@]}"
+
+      echo "Step 5) Update ${ANYCONTEXT_CN} with the new cert ($(echo ${NEW_CERT} | jq -r '.common_name'))"
+      anypoint_update_context "${ANYCONTEXT}" "${NEW_CERT}"
+
+      echo "Job Complete! ${ANYCONTEXT_CN} has been updated and expires on $(echo ${NEW_CERT} | jq -r '.expires')"
+    fi
+  fi
+}
+
+# echo "Validating existing cert exists"
+# This will download the cert. Doesn't look like we need to.
+# </dev/null openssl s_client -connect ${CERTCN}:443 -servername ${CERTCN} | openssl x509 > ${TMPCERTPATH}
+
+main
