@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+
+# TODO:
+# 1. Revoke the old cert.
+# 2. Allow for the creation of a new context with a name standard
+# e.g. global-mulesoftplatform-com-context
+#
+
 ##############################################
 ## GETOPT VARIABLES + ARGUMENT PARSING START##
 ##############################################
@@ -162,8 +169,11 @@ function anypoint_update_context() {
 
   local CERT_ID=$(echo ${CERT} | jq -r '.id')
   local CERT_NAME=$(echo ${CERT} | jq -r '.common_name')
+  local CERT_CREATED=$(echo ${CERT} | jq -r '.created')
 
-  local DIRSTRUCT="${CERT_NAME}/$(date '+%Y-%m-%d')"
+  # Converted from "today" to the day the cert was created. 
+  local DIRSTRUCT="${CERT_NAME}/$(date -d "${CERT_CREATED}" +'%Y-%m-%d')"
+
   # TODO: This is specific to me.
   local PERMADIR="${HOME}/certs/${DIRSTRUCT}"
   local PKFILE="${PERMADIR}/${ZSSLPRIKEY}"
